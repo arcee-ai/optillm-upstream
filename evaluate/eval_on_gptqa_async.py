@@ -5,15 +5,18 @@ import logging
 import os
 import re
 import time
+import json
+import asyncio
 from datetime import datetime
 from collections import Counter
+from typing import Dict, Any, List
 
 import fire
 from tqdm import tqdm
-from utils import call_model_with_retries, create_prompts, get_api_type, load_examples, CHAT_MODELS
+from openai import AsyncOpenAI
+from utils import create_prompts, get_api_type, load_examples, CHAT_MODELS
 
-APPROACHES = [ "mcts","bon", "moa", "rto", "z3", "self_consistency", "pvg", "rstar", "cot_reflection", "plansearch", "leap", "re2"]
-
+APPROACHES = ["mcts", "bon", "moa", "rto", "z3", "self_consistency", "pvg", "rstar", "cot_reflection", "plansearch", "leap", "re2"]
 
 class AnswerPredictor:
 
@@ -31,17 +34,22 @@ class AnswerPredictor:
         self.seed = seed
         self.num_gpus = num_gpus
         self.use_greedy_sampling = use_greedy_sampling
+        self.client = AsyncOpenAI(api_key="BLEH", base_url="https://inference-time.research.arcee.ai/v1")
     
         if self.prompt_type == 'few_shot':
             raise ValueError('Few-shot deprecated - use `5_shot` instead')
     
-    def get_response_from_cache_or_model(self, prompt, call_type='sample', temperature=0.0, inference_method: str = "mcts"):
-               
-        resp = call_model_with_retries(prompt, self.model_name, call_type=call_type, temperature=temperature, inference_method=inference_method)
-        return resp
+    async def get_response_from_model(self, prompt: str, inference_method: str = "mcts") -> Dict[str, Any]:
+        content = f"<optillm_approach>{inference_method}</optillm_approach> {prompt}"
+        response = await self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": content}],
+            temperature=0.0
+        )
+        return response
            
     @staticmethod
-    def parse_sampled_answer(answer):
+    def parse_sampled_answer(answer: str) -> str:
         patterns = [r'answer is \((.)\)', r'Answer: \((.)\)', r'answer: \((.)\)', r'answer \((.)\)', r'\((.)\)']
     
         for pattern in patterns:
@@ -50,21 +58,40 @@ class AnswerPredictor:
                 return match.group(1)
         return None
     
-    def sample_answer(self, prompt, temperature=0.0, response_index=0, inference_method: str = "mcts"):
-        resp = self.get_response_from_cache_or_model(prompt, call_type='sample', temperature=temperature, inference_method=inference_method)
-        if type(resp) == list:
-            resp = resp[response_index]
-        else:
-            api_type = get_api_type(self.model_name)
-            if api_type == 'openai':
-                if self.model_name in CHAT_MODELS:
-                    answer = resp.choices[0].message.content
-                else:
-                    answer = resp.choices[0].text
+    async def sample_answer(self, prompt: str, inference_method: str = "mcts"):
+        response = await self.get_response_from_model(prompt, inference_method=inference_method)
+        answer = response.choices[0].message.content
         return self.parse_sampled_answer(answer), answer
 
-    def main(self):
-        # Dictionary to store results for each method
+    async def process_example(self, question_id: int, prompt: str, example: Any, inference_method: str, csvwriter):
+        if self.verbose:
+            print(f"Question: {example.question}")
+
+        start_time = time.time()
+        sampled_answer, model_response = await self.sample_answer(prompt, inference_method=inference_method)
+        response_time = time.time() - start_time
+
+        if sampled_answer is None:
+            print(f"Couldn't find an answer choice for prompt: {prompt}")
+            logging.info("Couldn't find an answer choice!")
+            csvwriter.writerow([question_id, example.question, example[example.correct_index + 1], 
+                             "Couldn't find an answer choice!", False, model_response, response_time])
+            return 0, 1, response_time
+            
+        ans_correct_str = f"Correct answer: {example[example.correct_index + 1]}\nChosen answer: {example[self.LETTER_TO_INDEX[sampled_answer] + 1]}"
+        logging.info(ans_correct_str)
+        
+        if self.verbose:
+            print(ans_correct_str)
+            
+        is_correct = self.LETTER_TO_INDEX[sampled_answer] == example.correct_index
+        
+        csvwriter.writerow([question_id, example.question, example[example.correct_index + 1], 
+                         example[self.LETTER_TO_INDEX[sampled_answer] + 1], is_correct, model_response, response_time])
+                         
+        return int(is_correct), 0, response_time
+
+    async def main(self):
         method_results = {}
         
         log_dir = "logs"
@@ -94,34 +121,12 @@ class AnswerPredictor:
                 csvwriter.writerow(['Question id', 'Question', 'Correct answer', 'Model answer', 'Correct', 'Model response', 'Response time (s)'])
                 
                 for question_id, (prompt, example) in tqdm(enumerate(zip(prompts, examples)), total=len(examples)):
-                    if self.verbose:
-                        print(f"Question: {example.question}")
-
-                    start_time = time.time()
-                    sampled_answer, model_response = self.sample_answer(prompt, inference_method=inference_method)
-                    response_time = time.time() - start_time
+                    is_correct, refusal, response_time = await self.process_example(
+                        question_id, prompt, example, inference_method, csvwriter
+                    )
+                    correct += is_correct
+                    refusals += refusal
                     total_time += response_time
-                
-                    if sampled_answer is None:
-                        print(f"Couldn't find an answer choice for prompt: {prompt}")
-                        logging.info("Couldn't find an answer choice!")
-                        refusals += 1
-                        csvwriter.writerow([question_id, example.question, example[example.correct_index + 1], 
-                                         "Couldn't find an answer choice!", False, model_response, response_time])
-                        continue
-                        
-                    ans_correct_str = f"Correct answer: {example[example.correct_index + 1]}\nChosen answer: {example[self.LETTER_TO_INDEX[sampled_answer] + 1]}"
-                    logging.info(ans_correct_str)
-                    
-                    if self.verbose:
-                        print(ans_correct_str)
-                        
-                    is_correct = self.LETTER_TO_INDEX[sampled_answer] == example.correct_index
-                    if is_correct:
-                        correct += 1
-                        
-                    csvwriter.writerow([question_id, example.question, example[example.correct_index + 1], 
-                                     example[self.LETTER_TO_INDEX[sampled_answer] + 1], is_correct, model_response, response_time])
 
             accuracy = correct / len(examples)
             refusal_rate = refusals / len(examples)
@@ -148,6 +153,8 @@ class AnswerPredictor:
             for method, results in method_results.items():
                 csvwriter.writerow([method, results['accuracy'], results['refusal_rate'], results['avg_time']])
 
-
 if __name__ == '__main__':
-    fire.Fire(AnswerPredictor)
+    predictor = fire.Fire(AnswerPredictor)
+    asyncio.run(predictor.main())
+
+#python eval_on_gptqa.py main --data_filename datasets/gpqa_diamond.csv --prompt_type zero_shot
